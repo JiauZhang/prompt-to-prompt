@@ -7,6 +7,9 @@ from typing import Any, Callable, Dict, List, Optional, Union
 logger = logging.get_logger(__name__)
 
 class CrossAttnCtrl:
+    def __init__(self):
+        self.ctrl = False
+
     def __call__(
         self, attn, hidden_states, encoder_hidden_states=None, attention_mask=None,
     ):
@@ -37,13 +40,19 @@ class CrossAttnCtrl:
 class Editor(StableDiffusionPipeline):
     def __init__(
         self, vae, text_encoder, tokenizer, unet, scheduler,
-        safety_checker, feature_extractor,
+        safety_checker, feature_extractor, processor=None,
         requires_safety_checker: bool = True,
     ):
         super().__init__(
             vae, text_encoder, tokenizer, unet, scheduler,
             safety_checker, feature_extractor, requires_safety_checker,
         )
+
+        if processor:
+            self.processor = processor
+            self.unet.set_attn_processor(self.processor)
+        else:
+            raise RuntimeError('processor must be set!')
 
     def _encode_prompt(
         self, prompt, device, num_images_per_prompt, do_classifier_free_guidance,
@@ -164,7 +173,6 @@ class Editor(StableDiffusionPipeline):
         negative_prompt_embeds: Optional[torch.FloatTensor] = None,
         output_type: Optional[str] = "pil",
         return_dict: bool = True,
-        callback: Optional[Callable[[int, int, torch.FloatTensor], None]] = None,
         callback_steps: int = 1,
         cross_attention_kwargs: Optional[Dict[str, Any]] = None,
         prompt_target=None,
@@ -185,14 +193,14 @@ class Editor(StableDiffusionPipeline):
         device = self._execution_device
         do_classifier_free_guidance = guidance_scale > 1.0
         prompt_embeds, prompt_ids = self._encode_prompt(
-            prompt,
-            device,
-            num_images_per_prompt,
-            do_classifier_free_guidance,
-            negative_prompt,
-            prompt_embeds=prompt_embeds,
-            negative_prompt_embeds=negative_prompt_embeds,
+            prompt, device, num_images_per_prompt, do_classifier_free_guidance,
+            negative_prompt, prompt_embeds=None, negative_prompt_embeds=negative_prompt_embeds,
         )
+        if prompt_target:
+            prompt_target_embeds, prompt_target_ids = self._encode_prompt(
+                prompt_target, device, num_images_per_prompt, do_classifier_free_guidance,
+                negative_prompt, prompt_embeds=None, negative_prompt_embeds=negative_prompt_embeds,
+            )
         self.scheduler.set_timesteps(num_inference_steps, device=device)
         timesteps = self.scheduler.timesteps
         num_channels_latents = self.unet.in_channels
@@ -209,34 +217,37 @@ class Editor(StableDiffusionPipeline):
 
         extra_step_kwargs = self.prepare_extra_step_kwargs(generator, eta)
         num_warmup_steps = len(timesteps) - num_inference_steps * self.scheduler.order
+        latents_buffer = [latents, latents]
+        prompt_bufefr = [prompt_embeds, prompt_target_embeds]
         with self.progress_bar(total=num_inference_steps) as progress_bar:
             for i, t in enumerate(timesteps):
-                # expand the latents if we are doing classifier free guidance
-                latent_model_input = torch.cat([latents] * 2) if do_classifier_free_guidance else latents
-                latent_model_input = self.scheduler.scale_model_input(latent_model_input, t)
+                for k in range(2):
+                    latents = latents_buffer[k]
+                    # expand the latents if we are doing classifier free guidance
+                    latent_model_input = torch.cat([latents] * 2) if do_classifier_free_guidance else latents
+                    latent_model_input = self.scheduler.scale_model_input(latent_model_input, t)
 
-                # predict the noise residual
-                noise_pred = self.unet(
-                    latent_model_input,
-                    t,
-                    encoder_hidden_states=prompt_embeds,
-                    cross_attention_kwargs=cross_attention_kwargs,
-                ).sample
+                    # predict the noise residual
+                    noise_pred = self.unet(
+                        latent_model_input,
+                        t,
+                        encoder_hidden_states=prompt_bufefr[k],
+                        cross_attention_kwargs=cross_attention_kwargs,
+                    ).sample
 
-                # perform guidance
-                if do_classifier_free_guidance:
-                    noise_pred_uncond, noise_pred_text = noise_pred.chunk(2)
-                    noise_pred = noise_pred_uncond + guidance_scale * (noise_pred_text - noise_pred_uncond)
+                    # perform guidance
+                    if do_classifier_free_guidance:
+                        noise_pred_uncond, noise_pred_text = noise_pred.chunk(2)
+                        noise_pred = noise_pred_uncond + guidance_scale * (noise_pred_text - noise_pred_uncond)
 
-                # compute the previous noisy sample x_t -> x_t-1
-                latents = self.scheduler.step(noise_pred, t, latents, **extra_step_kwargs).prev_sample
-
+                    # compute the previous noisy sample x_t -> x_t-1
+                    latents = self.scheduler.step(noise_pred, t, latents, **extra_step_kwargs).prev_sample
+                    latents_buffer[k] = latents.detach()
                 # call the callback, if provided
                 if i == len(timesteps) - 1 or ((i + 1) > num_warmup_steps and (i + 1) % self.scheduler.order == 0):
                     progress_bar.update()
-                    if callback is not None and i % callback_steps == 0:
-                        callback(i, t, latents)
 
+        latents = torch.cat(latents_buffer)
         if output_type == "latent":
             image = latents
             has_nsfw_concept = None
