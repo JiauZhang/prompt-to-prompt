@@ -9,6 +9,7 @@ logger = logging.get_logger(__name__)
 class CrossAttnCtrl:
     def __init__(self):
         self.ctrl = False
+        self.attn_probs = {}
 
     def __call__(
         self, attn, hidden_states, encoder_hidden_states=None, attention_mask=None,
@@ -16,8 +17,8 @@ class CrossAttnCtrl:
         batch_size, sequence_length, _ = hidden_states.shape
         attention_mask = attn.prepare_attention_mask(attention_mask, sequence_length, batch_size)
         query = attn.to_q(hidden_states)
-
-        if encoder_hidden_states is None:
+        cross_attn = True if encoder_hidden_states is not None else False
+        if not cross_attn:
             encoder_hidden_states = hidden_states
         elif attn.cross_attention_norm:
             encoder_hidden_states = attn.norm_cross(encoder_hidden_states)
@@ -30,6 +31,13 @@ class CrossAttnCtrl:
         value = attn.head_to_batch_dim(value)
 
         attention_probs = attn.get_attention_scores(query, key, attention_mask)
+
+        if cross_attn:
+            if self.ctrl:
+                self.attn_probs[id(attn)] = attention_probs.detach()
+            else:
+                attention_probs = self.attn_probs[id(attn)]
+
         hidden_states = torch.bmm(attention_probs, value)
         hidden_states = attn.batch_to_head_dim(hidden_states)
         hidden_states = attn.to_out[0](hidden_states)
@@ -226,7 +234,7 @@ class Editor(StableDiffusionPipeline):
                     # expand the latents if we are doing classifier free guidance
                     latent_model_input = torch.cat([latents] * 2) if do_classifier_free_guidance else latents
                     latent_model_input = self.scheduler.scale_model_input(latent_model_input, t)
-
+                    self.processor.ctrl = k % 2 == 0
                     # predict the noise residual
                     noise_pred = self.unet(
                         latent_model_input,
