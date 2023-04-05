@@ -3,6 +3,7 @@ from diffusers import StableDiffusionPipeline
 from diffusers.pipelines.stable_diffusion import StableDiffusionPipelineOutput
 from diffusers.utils import logging
 from typing import Any, Callable, Dict, List, Optional, Union
+from seq_aligner import get_seq_mapper
 
 logger = logging.get_logger(__name__)
 
@@ -10,6 +11,8 @@ class CrossAttnCtrl:
     def __init__(self):
         self.ctrl = False
         self.attn_probs = {}
+        self.mapper = []
+        self.alphas = []
 
     def __call__(
         self, attn, hidden_states, encoder_hidden_states=None, attention_mask=None,
@@ -36,7 +39,7 @@ class CrossAttnCtrl:
             if self.ctrl:
                 self.attn_probs[id(attn)] = attention_probs.detach()
             else:
-                attention_probs = self.attn_probs[id(attn)]
+                attention_probs = self.attn_probs[id(attn)] * self.alphas + attention_probs * (1 - self.alphas)
 
         hidden_states = torch.bmm(attention_probs, value)
         hidden_states = attn.batch_to_head_dim(hidden_states)
@@ -209,6 +212,7 @@ class Editor(StableDiffusionPipeline):
                 prompt_target, device, num_images_per_prompt, do_classifier_free_guidance,
                 negative_prompt, prompt_embeds=None, negative_prompt_embeds=negative_prompt_embeds,
             )
+            self.processor.mapper, self.processor.alphas = get_seq_mapper(prompt_ids, prompt_target_ids, device)
         self.scheduler.set_timesteps(num_inference_steps, device=device)
         timesteps = self.scheduler.timesteps
         num_channels_latents = self.unet.in_channels
